@@ -17,71 +17,101 @@
 #include "win32_cursor.h"
 #include <UIAutomation.h>
 #include <oleauto.h>
+#include <dwmapi.h>
+#include <cmath>
 
 global_variable bool32 Running;
+global_variable UINT g_msgShellHook {};
 
 
 
-void DebugFormattedW(const wchar_t* name, int value)
+internal RECT GetWorkRectFromMonitor(HMONITOR hmon) {
+    MONITORINFOEX mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfo(hmon, &mi);
+    return mi.rcWork; // use work area (respects taskbar, orientation)
+}
+
+internal bool IsEffectivelyZeroSize(const RECT& r) {
+    return (r.right - r.left) <= 1 || (r.bottom - r.top) <= 1;
+}
+
+internal void MoveWindowPreservingRelativePosition_NoResize(HWND hwnd, HMONITOR hmonDst) {
+    if (!IsWindow(hwnd)) return;
+    
+    // Ignore child/tool windows and invisible shells (optional but reduces noise)
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    if (style & WS_CHILD) return;
+    
+    // Source/dest monitors
+    HMONITOR hmonSrc = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    RECT rws = GetWorkRectFromMonitor(hmonSrc);
+    RECT rwd = GetWorkRectFromMonitor(hmonDst);
+    
+    // Current outer rect (in screen coords)
+    RECT w; 
+    if (!GetWindowRect(hwnd, &w)) return;
+    
+    // If zero-sized/placeholder (common during creation), bail
+    if (IsEffectivelyZeroSize(w)) return;
+    
+    // If maximized, restore → move → re-maximize (feels natural across monitors)
+    bool wasMaximized = (style & WS_MAXIMIZE) != 0;
+    if (wasMaximized) ShowWindow(hwnd, SW_RESTORE);
+    
+    // Use the window *center* as anchor for relative mapping
+    const double cx = 0.5 * (double(w.left) + double(w.right));
+    const double cy = 0.5 * (double(w.top)  + double(w.bottom));
+    const double rw = double(rws.right  - rws.left);
+    const double rh = double(rws.bottom - rws.top);
+    
+    // Relative (0..1), clamped to guard partially off-screen windows
+    double rx = rw > 0 ? (cx - rws.left) / rw : 0.5;
+    double ry = rh > 0 ? (cy - rws.top ) / rh : 0.5;
+    rx = max(0.0, min(1.0, rx));
+    ry = max(0.0, min(1.0, ry));
+    
+    // Map to destination work area
+    const double dw = double(rwd.right  - rwd.left);
+    const double dh = double(rwd.bottom - rwd.top);
+    const double cxp = rwd.left + rx * dw;
+    const double cyp = rwd.top  + ry * dh;
+    
+    const int ww = (w.right - w.left);
+    const int hh = (w.bottom - w.top);
+    
+    int newLeft = (int)llround(cxp - ww * 0.5);
+    int newTop  = (int)llround(cyp - hh * 0.5);
+    
+    // Clamp fully inside destination work area
+    newLeft = max(rwd.left,  min(newLeft, rwd.right  - ww));
+    newTop  = max(rwd.top,   min(newTop,  rwd.bottom - hh));
+    
+    SetWindowPos(hwnd, nullptr, newLeft, newTop, 0, 0,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+    
+    if (wasMaximized) ShowWindow(hwnd, SW_MAXIMIZE);
+}
+
+
+internal void DebugFormattedW(const wchar_t* name, int value)
 {
     wchar_t buf[256];
     StringCchPrintfW(buf, 256, L"Name: %s, Value: %d", name, value);
     OutputDebugStringW(buf);
 }
 
-
-class NewWindowAutomationHandler : public IUIAutomationEventHandler
+void MoveToMouseMonitor(HWND WindowHandle) 
 {
-    public:
-    // IUnknown
-    ULONG STDMETHODCALLTYPE AddRef() override 
-    {
-        return static_cast<ULONG>(InterlockedIncrement(&_refCount));
-    }
+    POINT mouse {};
+    if (!GetCursorPos(&mouse)) return;
     
-    ULONG STDMETHODCALLTYPE Release() override 
-    {
-        ULONG val = static_cast<ULONG>(InterlockedDecrement(&_refCount));
-        if (val == 0) delete this;
-        return val;
-    }
+    HMONITOR hmonDst = MonitorFromPoint(mouse, MONITOR_DEFAULTTONEAREST);
+    if (!hmonDst) return;
     
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override 
-    {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IUIAutomationEventHandler)) 
-        {
-            *ppvObject = static_cast<IUIAutomationEventHandler*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppvObject = nullptr;
-        return E_NOINTERFACE;
-    }
-    
-    // IUIAutomationEventHandler
-    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement* sender, EVENTID eventId) override 
-    {
-        BSTR name = nullptr;
-        if (sender) {
-            if (SUCCEEDED(sender->get_CurrentName(&name)) && name) 
-            {
-                // (use name if you need it)
-                //OutputDebugString(name);
-                DebugFormattedW(name, (int)eventId);
-                OutputDebugString(TEXT("\n"));
-                SysFreeString(name);
-            }
-        }
-        return S_OK;
-    }
-    
-    protected:
-    // Virtual dtor fixes the warnings and is standard for COM objects with virtual methods.
-    virtual ~NewWindowAutomationHandler() = default;
-    
-    private:
-    volatile LONG _refCount = 1; // Interlocked* expects (volatile) LONG*
-};
+    MoveWindowPreservingRelativePosition_NoResize(WindowHandle, hmonDst);
+}
+
 
 
 LRESULT CALLBACK MainWindowCallback(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
@@ -107,6 +137,18 @@ LRESULT CALLBACK MainWindowCallback(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
         }
         break;
         default:
+    }
+    
+    if (uMsg == g_msgShellHook)
+    {
+        switch (wParam)
+        {
+            case HSHELL_WINDOWCREATED:
+            OutputDebugString(TEXT("new window is created! \n"));
+            MoveToMouseMonitor((HWND)lParam);
+            break;
+            default:
+        }
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -192,40 +234,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     return 1;
                 }
                 
-                
-                //initing the Automation Client Interface
-                IUIAutomation *g_pAutomation {};
-                hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, 
-                                      __uuidof(IUIAutomation), (void**)&g_pAutomation);
-                
-                if (FAILED(hr)) {
-                    wprintf(L"CoCreateInstance failed: 0x%08X\n", hr);
-                    CoUninitialize();
-                    return 1;
-                }
-                
-                if(SUCCEEDED(hr))
-                {
-                    // UI Element that we want info from: Desktop
-                    IUIAutomationElement *DesktopElement;
-                    hr = g_pAutomation->GetRootElement(&DesktopElement);
-                    
-                    
-                    if (FAILED(hr) || !DesktopElement) {
-                        wprintf(L"GetRootElement failed: 0x%08X\n", hr);
-                        g_pAutomation->Release();
-                        CoUninitialize();
-                        return 1;
-                    }
-                    NewWindowAutomationHandler* handler = new NewWindowAutomationHandler();
-                    
-                    hr = g_pAutomation->AddAutomationEventHandler(UIA_Window_WindowOpenedEventId,
-                                                                  DesktopElement,
-                                                                  TreeScope_Children,
-                                                                  nullptr, // [in] IUIAutomationCacheRequest *cacheRequest, A pointer to a cache request, or NULL if no caching is wanted.
-                                                                  handler);
-                }
-                
+                g_msgShellHook = RegisterWindowMessage(L"SHELLHOOK");
+                RegisterShellHookWindow(WindowHandle);
                 
                 Running = true;
                 while(Running)
